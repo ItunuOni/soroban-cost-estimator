@@ -92,6 +92,10 @@ fn test_help_output() {
     assert!(stdout.contains("config"), "help should list config command");
     assert!(stdout.contains("cache"), "help should list cache command");
     assert!(stdout.contains("watch"), "help should list watch command");
+    assert!(
+        stdout.contains("--rpc-fallback-url"),
+        "help should list --rpc-fallback-url flag"
+    );
 }
 
 #[test]
@@ -123,6 +127,7 @@ fn test_estimate_help() {
         "--id",
         "--arg",
         "--cache-ttl",
+        "--clear-cache",
         "--json",
     ] {
         assert!(
@@ -217,6 +222,7 @@ fn test_cache_help() {
     assert_eq!(code, 0, "cache --help should exit 0; stderr: {stderr}");
     assert!(stdout.contains("verify"), "cache help should list verify");
     assert!(stdout.contains("query"), "cache help should list query");
+    assert!(stdout.contains("clear"), "cache help should list clear");
 }
 
 #[test]
@@ -300,6 +306,24 @@ fn test_unknown_flag_errors() {
 fn test_estimate_all_missing_wasm_errors() {
     let (_, _stderr, code) = run_cli(&["estimate-all"]);
     assert_ne!(code, 0, "estimate-all without --wasm should error");
+}
+
+#[test]
+fn test_rpc_fallback_url_flag_accepted() {
+    // Verify --rpc-fallback-url is accepted as a global argument.
+    let (_, stderr, code) = run_cli(&[
+        "--rpc-fallback-url",
+        "http://127.0.0.1:9999",
+        "estimate",
+        "--wasm",
+        "test.wasm",
+    ]);
+    // Should fail because file doesn't exist, NOT because --rpc-fallback-url is unknown.
+    assert_ne!(code, 0, "should error on missing file, not invalid args");
+    assert!(
+        !stderr.contains("unrecognized"),
+        "--rpc-fallback-url should be recognized; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -612,6 +636,16 @@ fn test_estimate_rpc_url_overrides_unknown_network() {
 /// (empty for no args). The entry is written directly into the SQLite cache
 /// database so the `estimate` command's cache-hit path can find it.
 fn seed_cache_entry(home: &Path, timestamp: &str) {
+    seed_cache_entry_for(home, "testnet", "(wasm upload)", 42, timestamp);
+}
+
+/// Seed a cache entry on the given network/function, in `home`.
+///
+/// A thin generalization of [`seed_cache_entry`] so tests can populate more
+/// than one network (or several functions) and exercise per-network
+/// cache-clear isolation. The row targets `tests/fixtures/minimal.wasm` with
+/// no args, exactly like [`seed_cache_entry`].
+fn seed_cache_entry_for(home: &Path, network: &str, function: &str, ledger: i64, timestamp: &str) {
     let wasm_bytes = std::fs::read("tests/fixtures/minimal.wasm").expect("read fixture");
     let wasm_hash = hex::encode(sha2::Sha256::digest(&wasm_bytes));
     let args_hash = hex::encode(sha2::Sha256::digest(b""));
@@ -631,10 +665,10 @@ fn seed_cache_entry(home: &Path, timestamp: &str) {
         rusqlite::params![
             1i64,
             wasm_hash,
-            "(wasm upload)",
+            function,
             args_hash,
-            "testnet",
-            42i64,
+            network,
+            ledger,
             1_000i64,
             500i64,
             250i64,
@@ -1269,6 +1303,156 @@ fn test_cache_query_json_flag_accepted() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// `cache clear` / `estimate --clear-cache` (Issue #24)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_cache_clear_help() {
+    let (stdout, stderr, code) = run_cli(&["cache", "clear", "--help"]);
+    assert_eq!(
+        code, 0,
+        "cache clear --help should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("--network"),
+        "cache clear help should mention --network; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_on_empty_cache_succeeds() {
+    // Default network is testnet; a pristine cache reports zero cleared.
+    let home = temp_home("cache-clear-empty");
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear on empty cache should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 0 cached estimate(s) for testnet."),
+        "should report zero cleared for testnet; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_cache_clear_removes_only_requested_network() {
+    let home = temp_home("cache-clear-network");
+    let now = chrono::Utc::now().to_rfc3339();
+    // Distinct function names per row: the cache key is (wasm_hash, function,
+    // args_hash) and does not include the network, so reusing "(wasm upload)"
+    // on mainnet would overwrite the testnet row.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "testnet", "increment", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    // Default `cache clear` targets testnet only.
+    let (stdout, stderr, code) = run_cli_in_home(&["cache", "clear"], Some(&home));
+    assert_eq!(code, 0, "cache clear should exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("Cleared 2 cached estimate(s) for testnet."),
+        "should report both testnet entries cleared; got: {stdout}"
+    );
+
+    // testnet is empty now; mainnet is untouched.
+    let (stdout, _, code) =
+        run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        !stdout.contains("No cached estimates match the query.") && stdout.contains("mainnet_fn"),
+        "mainnet entry should survive the testnet clear; got: {stdout}"
+    );
+
+    // An explicit --network clears only that network.
+    let (stdout, stderr, code) =
+        run_cli_in_home(&["cache", "clear", "--network", "mainnet"], Some(&home));
+    assert_eq!(
+        code, 0,
+        "cache clear mainnet should exit 0; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for mainnet."),
+        "should report the mainnet entry cleared; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "mainnet should be empty after its own clear; got: {stdout}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_flag_accepted() {
+    // --clear-cache must be a recognized estimate flag (the run fails on the
+    // missing WASM file, not on the argument).
+    let (_, stderr, code) = run_cli(&["estimate", "--wasm", "test.wasm", "--clear-cache"]);
+    assert_ne!(code, 0, "missing WASM file should still error");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--clear-cache should be a recognized argument; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_estimate_clear_cache_wipes_network_before_simulation() {
+    // A fresh testnet entry plus --cache-ttl would otherwise short-circuit on
+    // a cache hit. With --clear-cache the entry is wiped first, so the run
+    // falls through to the (dead) RPC endpoint — proving the clear ran before
+    // the simulation. The mainnet entry must survive untouched.
+    let home = temp_home("estimate-clear-cache");
+    let now = chrono::Utc::now().to_rfc3339();
+    // The testnet row must use the exact key `estimate` looks up for
+    // minimal.wasm (function "(wasm upload)", no args); the mainnet row uses
+    // a distinct function name so the two networks' rows coexist.
+    seed_cache_entry_for(&home, "testnet", "(wasm upload)", 42, &now);
+    seed_cache_entry_for(&home, "mainnet", "mainnet_fn", 77, &now);
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--cache-ttl",
+            "1h",
+            "--clear-cache",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+    assert_eq!(
+        code, 1,
+        "cleared cache should fall through to the dead RPC endpoint; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Cleared 1 cached estimate(s) for testnet."),
+        "stdout should announce the clear; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Cache hit"),
+        "--clear-cache must prevent a cache hit; got: {stdout}"
+    );
+
+    // testnet is empty; mainnet is untouched.
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "testnet"], Some(&home));
+    assert!(
+        stdout.contains("No cached estimates match the query."),
+        "testnet should have no entries left; got: {stdout}"
+    );
+    let (stdout, _, _) = run_cli_in_home(&["cache", "query", "--network", "mainnet"], Some(&home));
+    assert!(
+        stdout.contains("mainnet_fn"),
+        "mainnet entries should survive the testnet clear; got: {stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Simulation footprint metrics tests (Issue #2)
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -1338,6 +1522,10 @@ fn start_mock_rpc_server(
                                 r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"{ledger}","minResourceFee":"{min_fee}","transactionData":"{live_tx_data}"}}}}"#
                             )
                         }
+                    } else if req_str.contains("getHealth") {
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"healthy","latestLedger":{ledger}}}}}"#
+                        )
                     } else if req_str.contains("getLedgerEntries") {
                         format!(
                             r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":{ledger},"entries":[]}}}}"#
